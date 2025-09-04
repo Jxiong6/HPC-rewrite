@@ -1,10 +1,10 @@
 # ==============================================
-# File: generate_cython_openmp_files.py (v3.3-pow2+finalsqrt+matmul-generic+elem2d)
+# File: generate_cython_openmp_files.py (v3.4-final-return-generic)
 # - 通用 GEMM（任意层序 + 三种写法）
 # - 列表推导 / 一维写数组（单输出/多输出）
-# - 归约（含最终 sqrt 检测）
+# - 归约（✅ 最终 return 表达式通用化）
 # - 二维填充
-# - ✅ 新增：二维逐元素（支持 A[i,j]/A[i,常数]/A[常数,j] + 一元数学函数）
+# - 二维逐元素（支持 A[i,j]/A[i,常数]/A[常数,j] + 一元数学函数）
 # - ✅ 修复：int 常量不再变成 float（避免 3 -> 3.0 作为下标）
 # - ✅ 修复：checks 缩进统一，避免 Inconsistent indentation
 # ==============================================
@@ -617,24 +617,37 @@ def _inline_simple_names(expr: _ast.AST, scope_root: _ast.AST, allowed_names: se
         return _inline_simple_names(new_expr, scope_root, allowed_names, max_depth - 1)
     return new_expr
 
-# 最终 sqrt 检测
-def _need_final_sqrt(mod_or_fun_body: _ast.AST, var: str) -> bool:
-    body = mod_or_fun_body.body if isinstance(mod_or_fun_body, _ast.FunctionDef) else (mod_or_fun_body.body if isinstance(mod_or_fun_body, _ast.Module) else [])
+# ============ 新增：通用最终 return 表达式抽取（替代 _need_final_sqrt） ============
+def _final_return_expr(mod_or_fun_body: _ast.AST, var: str, allowed_names: set[str]) -> str:
+    """
+    返回最终的 return 表达式（转为 C 侧字符串）。
+    - 仅允许依赖 allowed_names ∪ {var} 的标量名；
+    - 不允许数组访问（allowed_arrays 为空）；
+    - 运算/函数集合由 _ExprWriter 限定；
+    - 若无法安全转换或未依赖 var，则回退为 var。
+    """
+    # 找到最后一个 return
+    body = mod_or_fun_body.body if isinstance(mod_or_fun_body, _ast.FunctionDef) else (
+        mod_or_fun_body.body if isinstance(mod_or_fun_body, _ast.Module) else []
+    )
     last_ret = None
     for n in body:
         if isinstance(n, _ast.Return):
             last_ret = n
     if last_ret is None or last_ret.value is None:
-        return False
-    v = last_ret.value
-    if isinstance(v, _ast.Call) and isinstance(v.func, _ast.Name) and v.func.id == 'sqrt' and len(v.args) == 1 and isinstance(v.args[0], _ast.Name) and v.args[0].id == var:
-        return True
-    if isinstance(v, _ast.BinOp) and isinstance(v.op, _ast.Pow) and isinstance(v.left, _ast.Name) and v.left.id == var and isinstance(v.right, _ast.Constant):
-        try:
-            return abs(float(v.right.value) - 0.5) < 1e-12
-        except Exception:
-            return False
-    return False
+        return var
+
+    # 仅允许 reduce 变量 + 形参名；不包含循环索引
+    names = set(allowed_names) | {var}
+    writer = _ExprWriter(allowed_names=names, allowed_arrays=set())
+    try:
+        expr_c = writer.visit(last_ret.value)
+    except Exception:
+        return var
+
+    # 必须依赖 var
+    used = any(isinstance(n, _ast.Name) and n.id == var for n in _ast.walk(last_ret.value))
+    return expr_c if used else var
 
 # ------------------------------ 代码生成 ------------------------------
 
@@ -911,14 +924,21 @@ def {func_name}({sig}):
     return code
 
 # ---- 单层归约 ----
-def _gen_reduction(excludes: set[str], func_name, n_expr: str, body_expr: _ast.AST, idx_name: str, reduce_var: str, for_scope: _ast.AST, default_threads, schedule, apply_sqrt_final: bool):
+def _gen_reduction(excludes: set[str], func_name, n_expr: str, body_expr: _ast.AST,
+                   idx_name: str, reduce_var: str, for_scope: _ast.AST,
+                   default_threads, schedule, ret_scope: _ast.AST):
     params, param_names = _params_from_sizes(excludes, n_expr)
     allowed_names = {idx_name, reduce_var} | set(param_names)
     rhs_node = _inline_simple_names(body_expr, for_scope, allowed_names)
     writer = _ExprWriter(allowed_names=allowed_names, allowed_arrays=set())
     rhs = writer.visit(rhs_node)
     sched = _schedule_literal(schedule)
-    ret_line = f"return sqrt({reduce_var})" if apply_sqrt_final else f"return {reduce_var}"
+
+
+    ret_expr = _final_return_expr(ret_scope, reduce_var, set(param_names))
+
+
+
     code = f"""
 {_HEADER}
 
@@ -936,12 +956,13 @@ def {func_name}({params}, int num_threads=0):
             locals_mv[tid * PAD] += {rhs}
     for t in range(T):
         {reduce_var} += locals_mv[t * PAD]
-    {ret_line}
+    return {ret_expr}
 """
     return code
 
 # ---- 多层 for 归约（含条件） ----
-def _gen_reduction_nested(excludes: set[str], func_name, outer_for: _ast.For, aug_node: _ast.AugAssign, reduce_var: str, default_threads, schedule, apply_sqrt_final: bool):
+def _gen_reduction_nested(excludes: set[str], func_name, outer_for: _ast.For, aug_node: _ast.AugAssign,
+                          reduce_var: str, default_threads, schedule, ret_scope: _ast.AST):
     idx_names, ranges, _ = _collect_nested_for_indices(outer_for)
     params, param_names = _params_from_sizes(excludes, *ranges)
     allowed_names = set(idx_names) | {reduce_var} | set(param_names)
@@ -972,7 +993,9 @@ def _gen_reduction_nested(excludes: set[str], func_name, outer_for: _ast.For, au
     sched = _schedule_literal(schedule)
     n0 = ranges[0]
     idx_decl = ", ".join(idx_names) if idx_names else "i"
-    ret_line = f"return sqrt({reduce_var})" if apply_sqrt_final else f"return {reduce_var}"
+
+    # 生成最终返回表达式
+    ret_expr = _final_return_expr(ret_scope, reduce_var, set(param_names))
 
     code = f"""
 {_HEADER}
@@ -991,7 +1014,7 @@ def {func_name}({params}, int num_threads=0):
 {body_block}
     for t in range(T):
         {reduce_var} += locals_mv[t * PAD]
-    {ret_line}
+    return {ret_expr}
 """
     return code
 
@@ -1020,41 +1043,6 @@ def {func_name}({params}, int num_threads=0):
     return code
 
 # ---- 二维逐元素 ----
-# def _gen_2d_elementwise(excludes: set[str], func_name: str,
-#                         out_name: str, i_name: str, j_name: str,
-#                         n0: str, n1: str, expr_node: _ast.AST,
-#                         inputs: set[str], default_threads, schedule):
-#     allowed_arrays = set(inputs) | {out_name}
-#     params, param_names = _params_from_sizes(excludes, n0, n1)
-#     allowed_names = {i_name, j_name} | set(param_names)
-
-#     writer = _ExprWriter(allowed_names=allowed_names, allowed_arrays=allowed_arrays)
-#     expr = writer.visit(expr_node)
-#     sched = _schedule_literal(schedule)
-
-#     inputs_sorted = sorted(inputs)
-#     checks = "".join([_emit_checks_2d(x) for x in inputs_sorted])
-#     in_mvs = "\n    ".join([f"cdef const double[:, ::1] {x}_mv = {x}" for x in inputs_sorted]) if inputs_sorted else ""
-#     inputs_sig = (", " + ", ".join([f"np.ndarray[np.double_t, ndim=2] {x}" for x in inputs_sorted])) if inputs_sorted else ""
-
-#     code = f"""
-# {_HEADER}
-
-# def {func_name}({params}{inputs_sig}, int num_threads=0):
-#     cdef Py_ssize_t {i_name}, {j_name}
-# {checks}
-#     cdef np.ndarray[np.double_t, ndim=2] {out_name} = np.empty(({n0}, {n1}), dtype=np.float64)
-#     cdef double[:, ::1] {out_name}_mv = {out_name}
-#     {in_mvs}
-#     if num_threads > 0:
-#         omp_set_num_threads(num_threads)
-#     with nogil, parallel():
-#         for {i_name} in prange({n0}, schedule="{sched}"):
-#             for {j_name} in range({n1}):
-#                 {out_name}_mv[{i_name}, {j_name}] = {expr}
-#     return {out_name}
-# """
-#     return code
 def _gen_2d_elementwise(excludes: set[str], func_name: str,
                         out_name: str, i_name: str, j_name: str,
                         n0: str, n1: str, expr_node: _ast.AST,
@@ -1164,7 +1152,6 @@ def convert_python_to_cython_omp_v2(py_func_code: str, func_name: str = "compute
     # 归约（多层优先）
     red_var = an.reduction_var()
     if red_var:
-        apply_sqrt = _need_final_sqrt(an.fun or an.root, red_var)
         for node in _ast.walk(an.root):
             if isinstance(node, _ast.For) and isinstance(node.iter, _ast.Call) and isinstance(node.iter.func, _ast.Name) and node.iter.func.id == 'range':
                 aug = None
@@ -1173,7 +1160,8 @@ def convert_python_to_cython_omp_v2(py_func_code: str, func_name: str = "compute
                         aug = s
                         break
                 if aug is not None:
-                    return _gen_reduction_nested(excludes, func_name, node, aug, red_var, default_threads, schedule, apply_sqrt)
+                    return _gen_reduction_nested(excludes, func_name, node, aug, red_var,
+                             default_threads, schedule, ret_scope=(an.fun or an.root))
         for n in _ast.walk(an.root):
             if isinstance(n, _ast.For) and isinstance(n.iter, _ast.Call) and isinstance(n.iter.func, _ast.Name) and n.iter.func.id == 'range':
                 rhs = None
@@ -1183,7 +1171,8 @@ def convert_python_to_cython_omp_v2(py_func_code: str, func_name: str = "compute
                 if rhs is not None:
                     n_expr = _ast.unparse(n.iter.args[0]) if n.iter.args else "n"
                     idx_name = n.target.id if isinstance(n.target, _ast.Name) else "i"
-                    return _gen_reduction(excludes, func_name, n_expr, rhs, idx_name, red_var, n, default_threads, schedule, apply_sqrt)
+                    return _gen_reduction(excludes, func_name, n_expr, rhs, idx_name, red_var,
+                      n, default_threads, schedule, ret_scope=(an.fun or an.root))
 
     # 兜底
     return f"""
